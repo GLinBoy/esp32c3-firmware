@@ -1,0 +1,1208 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include "driver/gpio.h"
+#include "driver/temperature_sensor.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include "esp_system.h"
+#include "esp_mac.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_timer.h"
+#include "nvs_flash.h"
+#include "nvs.h"
+#include "mqtt_client.h"
+
+#include "ble_prov.h"
+
+#define LED_GPIO GPIO_NUM_8
+#define LED_ON_LEVEL 0 /* active-low LED: 0 = on, 1 = off. Flip if wrong. */
+#define LED_OFF_LEVEL 1
+
+#define MQTT_BROKER_URI "mqtt://test.mosquitto.org:1883"
+#define REGISTRY_TOPIC "devices/registry"
+
+#define WIFI_RETRY_BASE_DELAY_MS 1000
+#define WIFI_RETRY_MAX_DELAY_MS 60000
+
+#define HEARTBEAT_INTERVAL_MS 30000 /* telemetry /status heartbeat interval */
+
+#define NVS_NAMESPACE "led_store"
+#define NVS_KEY_LED_STATE "led_state"
+
+#define WIFI_CREDS_NAMESPACE "wifi_store"
+#define NVS_KEY_WIFI_SSID "wifi_ssid"
+#define NVS_KEY_WIFI_PASS "wifi_pass"
+#define WIFI_SSID_MAX 32
+#define WIFI_PASS_MAX 64
+
+/* Device settings (NVS) - Wi-Fi fallback-to-provisioning policy.
+   NVS key names are limited to 15 chars, hence the shortened keys. */
+#define DEVICE_SETTINGS_NAMESPACE "device_settings"
+#define NVS_KEY_FALLBACK_ENABLED "fb_enabled"
+#define NVS_KEY_FALLBACK_TIMEOUT "fb_timeout"
+#define FALLBACK_TIMEOUT_MIN_MIN 1
+#define FALLBACK_TIMEOUT_MIN_MAX 5
+#define FALLBACK_TIMEOUT_MIN_DEFAULT 3
+
+#define WIFI_SET_PAYLOAD_MAX 1024 /* fits the 1024 B MQTT receive buffer */
+
+static const char *TAG = "led_mqtt";
+
+static char device_id[13];
+static char topic_led_set[48];
+static char topic_status[48];
+static char topic_wifi_set[64];
+
+static esp_mqtt_client_handle_t mqtt_client = NULL;
+
+static bool wifi_connected = false;
+static bool led_state = false; /* current logical LED state */
+static int wifi_retry_count = 0;
+static TaskHandle_t blink_task_handle = NULL;
+static esp_timer_handle_t wifi_retry_timer = NULL;
+static esp_timer_handle_t fallback_timer = NULL;
+static esp_timer_handle_t heartbeat_timer = NULL;
+static temperature_sensor_handle_t temp_sensor = NULL;
+
+/* Wi-Fi credentials (NVS first, compile-time defines as fallback) */
+static char wifi_ssid[WIFI_SSID_MAX];
+static char wifi_pass[WIFI_PASS_MAX];
+static bool wifi_creds_present = false;
+static bool provisioning_active = false;
+static bool fallback_enabled = true;
+static uint8_t fallback_timeout_min = FALLBACK_TIMEOUT_MIN_DEFAULT;
+static bool removed_blink = false;
+
+/* ---------- Persisted LED state ---------- */
+
+static void save_led_state(bool state)
+{
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK)
+    {
+        nvs_set_u8(handle, NVS_KEY_LED_STATE, state ? 1 : 0);
+        nvs_commit(handle);
+        nvs_close(handle);
+    }
+}
+
+static bool load_led_state(void)
+{
+    nvs_handle_t handle;
+    uint8_t value = 0;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK)
+    {
+        nvs_get_u8(handle, NVS_KEY_LED_STATE, &value);
+        nvs_close(handle);
+    }
+    return value != 0;
+}
+
+/* ---------- Persisted Wi-Fi credentials ---------- */
+
+static bool load_wifi_creds(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open(WIFI_CREDS_NAMESPACE, NVS_READONLY, &handle) == ESP_OK)
+    {
+        size_t len = sizeof(wifi_ssid);
+        if (nvs_get_str(handle, NVS_KEY_WIFI_SSID, wifi_ssid, &len) == ESP_OK &&
+            strlen(wifi_ssid) > 0)
+        {
+            len = sizeof(wifi_pass);
+            if (nvs_get_str(handle, NVS_KEY_WIFI_PASS, wifi_pass, &len) != ESP_OK)
+            {
+                wifi_pass[0] = '\0';
+            }
+            nvs_close(handle);
+            return true;
+        }
+        nvs_close(handle);
+    }
+
+    /* No stored credentials: the device must be provisioned over BLE. */
+    return false;
+}
+
+static void save_wifi_creds(const char *ssid, const char *pass)
+{
+    nvs_handle_t handle;
+    if (nvs_open(WIFI_CREDS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK)
+    {
+        nvs_set_str(handle, NVS_KEY_WIFI_SSID, ssid);
+        nvs_set_str(handle, NVS_KEY_WIFI_PASS, pass);
+        nvs_commit(handle);
+        nvs_close(handle);
+        ESP_LOGI(TAG, "Saved Wi-Fi credentials to NVS");
+    }
+    else
+    {
+        ESP_LOGE(TAG, "Failed to open NVS to save Wi-Fi credentials");
+    }
+}
+
+/* ---------- Persisted device settings (Wi-Fi fallback policy) ---------- */
+
+/* Loads the fallback settings into the globals, keeping the compile-time
+   defaults when the namespace does not exist yet (first boot). */
+static void load_device_settings(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open(DEVICE_SETTINGS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK)
+    {
+        uint8_t value = 0;
+        if (nvs_get_u8(handle, NVS_KEY_FALLBACK_ENABLED, &value) == ESP_OK)
+        {
+            fallback_enabled = value != 0;
+        }
+        if (nvs_get_u8(handle, NVS_KEY_FALLBACK_TIMEOUT, &value) == ESP_OK)
+        {
+            fallback_timeout_min = value;
+        }
+        nvs_close(handle);
+    }
+    else
+    {
+        ESP_LOGE(TAG, "Failed to open NVS for device settings");
+    }
+
+    if (fallback_timeout_min < FALLBACK_TIMEOUT_MIN_MIN)
+    {
+        fallback_timeout_min = FALLBACK_TIMEOUT_MIN_MIN;
+    }
+    else if (fallback_timeout_min > FALLBACK_TIMEOUT_MIN_MAX)
+    {
+        fallback_timeout_min = FALLBACK_TIMEOUT_MIN_MAX;
+    }
+
+    ESP_LOGI(TAG, "Fallback settings: enabled=%s timeout=%u min",
+             fallback_enabled ? "true" : "false", fallback_timeout_min);
+}
+
+static void save_device_settings(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open(DEVICE_SETTINGS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK)
+    {
+        nvs_set_u8(handle, NVS_KEY_FALLBACK_ENABLED, fallback_enabled ? 1 : 0);
+        nvs_set_u8(handle, NVS_KEY_FALLBACK_TIMEOUT, fallback_timeout_min);
+        nvs_commit(handle);
+        nvs_close(handle);
+        ESP_LOGI(TAG, "Saved fallback settings to NVS");
+    }
+    else
+    {
+        ESP_LOGE(TAG, "Failed to open NVS to save fallback settings");
+    }
+}
+
+/* ---------- Minimal JSON helpers ---------- */
+
+static bool json_get_string(const char *json, const char *key, char *out, size_t out_size)
+{
+    if (out_size == 0)
+    {
+        return false;
+    }
+    char pattern[48];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(json, pattern);
+    if (!p)
+    {
+        return false;
+    }
+    p += strlen(pattern);
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+    {
+        p++;
+    }
+    if (*p != ':')
+    {
+        return false;
+    }
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+    {
+        p++;
+    }
+    if (*p != '"')
+    {
+        return false;
+    }
+    p++;
+    size_t n = 0;
+    while (*p && *p != '"' && n + 1 < out_size)
+    {
+        if (*p == '\\' && p[1])
+        {
+            p++;
+            switch (*p)
+            {
+            case 'n':
+                out[n++] = '\n';
+                break;
+            case 't':
+                out[n++] = '\t';
+                break;
+            case 'r':
+                out[n++] = '\r';
+                break;
+            default:
+                out[n++] = *p; /* \\, \", etc. */
+                break;
+            }
+        }
+        else
+        {
+            out[n++] = *p;
+        }
+        p++;
+    }
+    out[n] = '\0';
+    return true;
+}
+
+/* True if the character may legally terminate a JSON literal (true/false). */
+static bool json_token_end(char c)
+{
+    return c == '\0' || c == ' ' || c == '\t' || c == '\r' || c == '\n' ||
+           c == ',' || c == '}' || c == ']';
+}
+
+static bool json_get_bool(const char *json, const char *key, bool *out)
+{
+    char pattern[48];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(json, pattern);
+    if (!p)
+    {
+        return false;
+    }
+    p += strlen(pattern);
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+    {
+        p++;
+    }
+    if (*p != ':')
+    {
+        return false;
+    }
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+    {
+        p++;
+    }
+    if (strncmp(p, "true", 4) == 0 && json_token_end(p[4]))
+    {
+        *out = true;
+        return true;
+    }
+    if (strncmp(p, "false", 5) == 0 && json_token_end(p[5]))
+    {
+        *out = false;
+        return true;
+    }
+    return false;
+}
+
+static bool json_get_int(const char *json, const char *key, int *out)
+{
+    char pattern[48];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(json, pattern);
+    if (!p)
+    {
+        return false;
+    }
+    p += strlen(pattern);
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+    {
+        p++;
+    }
+    if (*p != ':')
+    {
+        return false;
+    }
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+    {
+        p++;
+    }
+    char *end = NULL;
+    long value = strtol(p, &end, 10);
+    if (end == p)
+    {
+        return false;
+    }
+    *out = (int)value;
+    return true;
+}
+
+static void json_escape(const char *in, char *out, size_t out_size)
+{
+    static const char hexd[] = "0123456789abcdef";
+    size_t n = 0;
+    for (size_t i = 0; in[i] && n + 6 < out_size; i++)
+    {
+        unsigned char c = (unsigned char)in[i];
+        switch (c)
+        {
+        case '"':
+            out[n++] = '\\';
+            out[n++] = '"';
+            break;
+        case '\\':
+            out[n++] = '\\';
+            out[n++] = '\\';
+            break;
+        case '\n':
+            out[n++] = '\\';
+            out[n++] = 'n';
+            break;
+        case '\r':
+            out[n++] = '\\';
+            out[n++] = 'r';
+            break;
+        case '\t':
+            out[n++] = '\\';
+            out[n++] = 't';
+            break;
+        default:
+            if (c < 0x20)
+            {
+                out[n++] = '\\';
+                out[n++] = 'u';
+                out[n++] = '0';
+                out[n++] = '0';
+                out[n++] = hexd[(c >> 4) & 0xf];
+                out[n++] = hexd[c & 0xf];
+            }
+            else
+            {
+                out[n++] = (char)c;
+            }
+            break;
+        }
+    }
+    out[n] = '\0';
+}
+
+static const char *auth_to_str(wifi_auth_mode_t mode)
+{
+    switch (mode)
+    {
+    case WIFI_AUTH_OPEN:
+        return "OPEN";
+    case WIFI_AUTH_WEP:
+        return "WEP";
+    case WIFI_AUTH_WPA_PSK:
+        return "WPA";
+    case WIFI_AUTH_WPA2_PSK:
+        return "WPA2";
+    case WIFI_AUTH_WPA_WPA2_PSK:
+        return "WPA/WPA2";
+    case WIFI_AUTH_WPA2_ENTERPRISE:
+        return "WPA2-ENT";
+    case WIFI_AUTH_WPA3_PSK:
+        return "WPA3";
+    case WIFI_AUTH_WPA2_WPA3_PSK:
+        return "WPA2/WPA3";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+/* ---------- LED control ---------- */
+
+static void apply_led_gpio(bool on)
+{
+    gpio_set_level(LED_GPIO, on ? LED_ON_LEVEL : LED_OFF_LEVEL);
+}
+
+/* Forward declaration: set_led() re-announces registry state after a change */
+static void publish_registration(void);
+
+/* Forward declaration: used to resume the reconnect loop after a scan */
+static void schedule_wifi_retry(void);
+
+/* Forward declarations: used by the wifi/set command handler to re-apply the
+   fallback window when the fallback settings change */
+static void start_fallback_timer(void);
+static void stop_fallback_timer(void);
+
+static void set_led(bool on)
+{
+    led_state = on;
+    save_led_state(on);
+    if (wifi_connected)
+    {
+        apply_led_gpio(on);
+    }
+    /* Announce the new led_state immediately (retained) so clients stay in
+       sync without waiting for the next reconnect/boot. */
+    if (mqtt_client != NULL)
+    {
+        publish_registration();
+    }
+    ESP_LOGI(TAG, "LED state set to %s (persisted)", on ? "ON" : "OFF");
+}
+
+/* Blinks the LED while Wi-Fi is disconnected, or while the device is in
+   "removed" mode (credentials erased) even though Wi-Fi is still connected.
+   Stops itself once connected / re-provisioned, at which point the real
+   led_state is applied. */
+static void blink_task(void *arg)
+{
+    while (!wifi_connected || (removed_blink && !wifi_creds_present))
+    {
+        apply_led_gpio(true);
+        vTaskDelay(pdMS_TO_TICKS(300));
+        apply_led_gpio(false);
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+    /* Wi-Fi connected again (or credentials restored): restore the
+       persisted/last-known state */
+    apply_led_gpio(led_state);
+    blink_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void start_blinking_if_needed(void)
+{
+    removed_blink = false;
+    if (blink_task_handle == NULL)
+    {
+        xTaskCreate(blink_task, "led_blink", 2048, NULL, 5, &blink_task_handle);
+    }
+}
+
+/* Blink while in "removed" mode: credentials were erased but the current
+   Wi-Fi session is deliberately kept running until new credentials arrive
+   over BLE, so the normal disconnected-blink condition never triggers. */
+static void start_removed_blink(void)
+{
+    removed_blink = true;
+    if (blink_task_handle == NULL)
+    {
+        xTaskCreate(blink_task, "led_blink", 2048, NULL, 5, &blink_task_handle);
+    }
+}
+
+/* ---------- MQTT ---------- */
+
+static void build_device_identity(void)
+{
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    snprintf(device_id, sizeof(device_id), "%02x%02x%02x%02x%02x%02x",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+    snprintf(topic_led_set, sizeof(topic_led_set), "devices/%s/led/set", device_id);
+    snprintf(topic_status, sizeof(topic_status), "devices/%s/status", device_id);
+    snprintf(topic_wifi_set, sizeof(topic_wifi_set), "devices/%s/wifi/set", device_id);
+
+    ESP_LOGI(TAG, "Device ID: %s", device_id);
+}
+
+/* Publishes JSON online status with telemetry to devices/<id>/status.
+   retain=true for the connection announcement, false for heartbeats. */
+static void publish_status(bool retain)
+{
+    char payload[256];
+    char ssid_esc[WIFI_SSID_MAX * 2 + 1];
+    int rssi = 0;
+    float temp_c = 0.0f;
+
+    if (wifi_connected)
+    {
+        wifi_ap_record_t ap_info;
+        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK)
+        {
+            rssi = ap_info.rssi;
+        }
+    }
+
+    json_escape(wifi_ssid, ssid_esc, sizeof(ssid_esc));
+
+    if (temp_sensor != NULL)
+    {
+        temperature_sensor_get_celsius(temp_sensor, &temp_c);
+    }
+    int temp_tenths = (int)(temp_c * 10);
+
+    snprintf(payload, sizeof(payload),
+             "{\"state\":\"online\",\"device_id\":\"%s\",\"ssid\":\"%s\",\"rssi\":%d,"
+             "\"uptime_s\":%llu,\"temp_c\":%d.%d}",
+             device_id, ssid_esc, rssi,
+             (unsigned long long)(esp_timer_get_time() / 1000000ULL),
+             temp_tenths / 10, (temp_tenths < 0 ? -temp_tenths : temp_tenths) % 10);
+
+    esp_mqtt_client_publish(mqtt_client, topic_status, payload, 0, 1, retain ? 1 : 0);
+    ESP_LOGI(TAG, "Published status: %s", payload);
+}
+
+static void heartbeat_timer_cb(void *arg)
+{
+    /* Skip heartbeats once the device has been removed (no creds): the
+       retained offline status is the authoritative state until re-provisioned. */
+    if (mqtt_client != NULL && wifi_connected && wifi_creds_present)
+    {
+        publish_status(false);
+    }
+}
+
+static void publish_registration(void)
+{
+    char payload[160];
+    snprintf(payload, sizeof(payload),
+             "{\"device_id\":\"%s\",\"status\":\"online\",\"led_topic\":\"%s\",\"led_state\":\"%s\"}",
+             device_id, topic_led_set, led_state ? "ON" : "OFF");
+
+    esp_mqtt_client_publish(mqtt_client, REGISTRY_TOPIC, payload, 0, 1, 1);
+    publish_status(true);
+    ESP_LOGI(TAG, "Published registration: %s", payload);
+}
+
+/* ---------- wifi/set command channel ---------- */
+
+/* Publishes a retained online ack announcing that BLE re-provisioning has
+   been started. The device stays online with its current credentials. */
+static void publish_reprovisioning_ack(void)
+{
+    char payload[128];
+    snprintf(payload, sizeof(payload),
+             "{\"state\":\"online\",\"reprovisioning\":true}");
+    esp_mqtt_client_publish(mqtt_client, topic_status, payload, 0, 1, 1);
+    ESP_LOGI(TAG, "Published reprovisioning ack: %s", payload);
+}
+
+/* Publishes a retained online ack echoing the current fallback settings. */
+static void publish_fallback_ack(void)
+{
+    char payload[128];
+    snprintf(payload, sizeof(payload),
+             "{\"state\":\"online\",\"fallback_enabled\":%s,\"fallback_timeout_min\":%u}",
+             fallback_enabled ? "true" : "false", fallback_timeout_min);
+    esp_mqtt_client_publish(mqtt_client, topic_status, payload, 0, 1, 1);
+    ESP_LOGI(TAG, "Published fallback settings ack: %s", payload);
+}
+
+static void handle_reprovision(void)
+{
+    ESP_LOGI(TAG, "Received reprovision command");
+    if (!provisioning_active)
+    {
+        provisioning_active = true;
+        ble_prov_start_adv();
+    }
+    /* Stay online: credentials and the current Wi-Fi session are untouched. */
+    publish_reprovisioning_ack();
+}
+
+static void handle_remove_device(void)
+{
+    ESP_LOGI(TAG, "Received remove command");
+
+    /* Erase the Wi-Fi credentials; all other state (LED, settings) is kept.
+       Credentials are never cleared anywhere else. */
+    nvs_handle_t handle;
+    if (nvs_open(WIFI_CREDS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK)
+    {
+        nvs_erase_all(handle);
+        nvs_commit(handle);
+        nvs_close(handle);
+        ESP_LOGI(TAG, "Erased Wi-Fi credentials (%s)", WIFI_CREDS_NAMESPACE);
+    }
+    else
+    {
+        ESP_LOGW(TAG, "Could not open %s to erase", WIFI_CREDS_NAMESPACE);
+    }
+
+    wifi_creds_present = false;
+    wifi_ssid[0] = '\0';
+    wifi_pass[0] = '\0';
+
+    /* Look like a fresh device: blink and advertise, but keep the current
+       Wi-Fi/MQTT session running until new credentials arrive over BLE. */
+    start_removed_blink();
+    if (!provisioning_active)
+    {
+        provisioning_active = true;
+        ble_prov_start_adv();
+    }
+
+    char payload[128];
+    snprintf(payload, sizeof(payload), "{\"state\":\"offline\",\"reason\":\"removed\"}");
+    esp_mqtt_client_publish(mqtt_client, topic_status, payload, 0, 1, 1);
+    ESP_LOGI(TAG, "Published retained offline status (removed)");
+}
+
+static void handle_set_fallback(const char *json)
+{
+    bool enabled = false;
+    int timeout_min = 0;
+
+    if (!json_get_bool(json, "enabled", &enabled))
+    {
+        ESP_LOGW(TAG, "set_fallback missing or invalid 'enabled': %s", json);
+        return;
+    }
+    if (!json_get_int(json, "timeout_min", &timeout_min))
+    {
+        ESP_LOGW(TAG, "set_fallback missing or invalid 'timeout_min': %s", json);
+        return;
+    }
+
+    if (timeout_min < FALLBACK_TIMEOUT_MIN_MIN)
+    {
+        timeout_min = FALLBACK_TIMEOUT_MIN_MIN;
+    }
+    else if (timeout_min > FALLBACK_TIMEOUT_MIN_MAX)
+    {
+        timeout_min = FALLBACK_TIMEOUT_MIN_MAX;
+    }
+
+    fallback_enabled = enabled;
+    fallback_timeout_min = (uint8_t)timeout_min;
+    save_device_settings();
+
+    /* Apply the new policy to an in-progress fallback window: disabling stops
+       auto-provisioning; enabling (re)arms it from now with the new timeout. */
+    stop_fallback_timer();
+    if (fallback_enabled && wifi_creds_present && !wifi_connected && !provisioning_active)
+    {
+        start_fallback_timer();
+    }
+
+    ESP_LOGI(TAG, "Fallback settings updated: enabled=%s timeout=%u min",
+             fallback_enabled ? "true" : "false", fallback_timeout_min);
+    publish_fallback_ack();
+}
+
+static void handle_wifi_set_command(const char *data, size_t len)
+{
+    if (len == 0 || len >= WIFI_SET_PAYLOAD_MAX)
+    {
+        ESP_LOGW(TAG, "wifi/set payload too large or empty (%u bytes)", (unsigned)len);
+        return;
+    }
+    char json[WIFI_SET_PAYLOAD_MAX];
+    memcpy(json, data, len);
+    json[len] = '\0';
+    ESP_LOGI(TAG, "wifi/set command received: %s", json);
+
+    char command[16];
+    if (!json_get_string(json, "command", command, sizeof(command)))
+    {
+        ESP_LOGW(TAG, "wifi/set payload missing 'command': %s", json);
+        return;
+    }
+
+    if (strcmp(command, "reprovision") == 0)
+    {
+        handle_reprovision();
+    }
+    else if (strcmp(command, "remove") == 0)
+    {
+        handle_remove_device();
+    }
+    else if (strcmp(command, "set_fallback") == 0)
+    {
+        handle_set_fallback(json);
+    }
+    else
+    {
+        ESP_LOGW(TAG, "Unknown wifi/set command: %s", command);
+    }
+}
+
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
+                               int32_t event_id, void *event_data)
+{
+    esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
+
+    switch ((esp_mqtt_event_id_t)event_id)
+    {
+    case MQTT_EVENT_CONNECTED:
+        ESP_LOGI(TAG, "MQTT connected");
+        esp_mqtt_client_subscribe(mqtt_client, topic_led_set, 1);
+        esp_mqtt_client_subscribe(mqtt_client, topic_wifi_set, 1);
+        publish_registration();
+        break;
+
+    case MQTT_EVENT_DISCONNECTED:
+        ESP_LOGW(TAG, "MQTT disconnected");
+        break;
+
+    case MQTT_EVENT_DATA:
+        if (strncmp(event->topic, topic_led_set, event->topic_len) == 0)
+        {
+            if (event->data_len == 2 && strncmp(event->data, "ON", 2) == 0)
+            {
+                set_led(true);
+            }
+            else if (event->data_len == 3 && strncmp(event->data, "OFF", 3) == 0)
+            {
+                set_led(false);
+            }
+            else
+            {
+                ESP_LOGW(TAG, "Unknown payload: %.*s", event->data_len, event->data);
+            }
+        }
+        else if (strncmp(event->topic, topic_wifi_set, event->topic_len) == 0)
+        {
+            if (event->data_len == event->total_data_len)
+            {
+                handle_wifi_set_command(event->data, event->data_len);
+            }
+            else
+            {
+                ESP_LOGW(TAG, "Ignoring chunked wifi/set message (%d/%d bytes)",
+                         event->data_len, event->total_data_len);
+            }
+        }
+        break;
+
+    default:
+        break;
+    }
+}
+
+static void start_mqtt(void)
+{
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = MQTT_BROKER_URI,
+        .session.last_will = {
+            .topic = topic_status,
+            .msg = "{\"state\":\"offline\"}",
+            .qos = 1,
+            .retain = 1,
+        },
+    };
+
+    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_start(mqtt_client);
+}
+
+/* ---------- BLE provisioning ---------- */
+
+static void ble_prov_send_status(const char *wifi_state, const char *detail)
+{
+    char line[160];
+    snprintf(line, sizeof(line), "{\"type\":\"status\",\"wifi\":\"%s\",\"detail\":\"%s\"}",
+             wifi_state, detail);
+    ble_prov_send(line);
+}
+
+static void wifi_scan_start(void)
+{
+    /* Pause any pending reconnect attempt so it doesn't collide with the scan. */
+    if (wifi_retry_timer)
+    {
+        esp_timer_stop(wifi_retry_timer);
+    }
+
+    wifi_scan_config_t scan_cfg = {
+        .ssid = NULL,
+        .bssid = NULL,
+        .channel = 0,
+        .show_hidden = true,
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+        .scan_time.active.min = 100,
+        .scan_time.active.max = 300,
+    };
+    esp_err_t err = esp_wifi_scan_start(&scan_cfg, false);
+    if (err == ESP_OK)
+    {
+        ESP_LOGI(TAG, "Wi-Fi scan started");
+        ble_prov_send_status("scanning", "scan started");
+    }
+    else
+    {
+        ESP_LOGW(TAG, "Could not start scan: %s", esp_err_to_name(err));
+        ble_prov_send_status("scan_error", esp_err_to_name(err));
+    }
+}
+
+static void handle_scan_done(void)
+{
+    uint16_t count = 0;
+    esp_wifi_scan_get_ap_num(&count);
+
+    wifi_ap_record_t *records = NULL;
+    if (count > 0)
+    {
+        records = calloc(count, sizeof(wifi_ap_record_t));
+        if (records != NULL)
+        {
+            esp_wifi_scan_get_ap_records(&count, records);
+        }
+        else
+        {
+            ESP_LOGE(TAG, "Out of memory for scan results");
+            count = 0;
+        }
+    }
+
+    for (uint16_t i = 0; i < count; i++)
+    {
+        char line[320];
+        char ssid_esc[96];
+        json_escape((const char *)records[i].ssid, ssid_esc, sizeof(ssid_esc));
+        snprintf(line, sizeof(line),
+                 "{\"type\":\"scan_result\",\"ssid\":\"%s\",\"rssi\":%d,\"auth\":\"%s\",\"channel\":%u}",
+                 ssid_esc, records[i].rssi, auth_to_str(records[i].authmode),
+                 records[i].primary);
+        esp_err_t send_rc = ble_prov_send(line);
+        if (send_rc != ESP_OK)
+        {
+            ESP_LOGW(TAG, "scan_result send failed: %s", esp_err_to_name(send_rc));
+        }
+        /* Pace the notifications so the BLE link (one ATT packet per
+           connection event) can keep up with the burst of results. */
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    free(records);
+
+    char done[64];
+    snprintf(done, sizeof(done), "{\"type\":\"scan_done\",\"count\":%u}", count);
+    esp_err_t done_rc = ble_prov_send(done);
+    if (done_rc != ESP_OK)
+    {
+        ESP_LOGW(TAG, "scan_done send failed: %s", esp_err_to_name(done_rc));
+    }
+    ESP_LOGI(TAG, "Scan done: %u APs", count);
+
+    /* Resume the automatic reconnect loop that the scan paused. */
+    if (!wifi_connected && wifi_creds_present)
+    {
+        schedule_wifi_retry();
+    }
+}
+
+static void start_provisioning(void)
+{
+    if (provisioning_active)
+    {
+        return;
+    }
+    provisioning_active = true;
+    ESP_LOGW(TAG, "Wi-Fi unavailable - starting BLE provisioning");
+    ble_prov_start_adv();
+}
+
+/* Fires when the time-window policy expires: the device still has stored
+   credentials but has not connected within fallback_timeout_min, so it falls
+   back to BLE provisioning and stays there (retries are stopped). */
+static void fallback_timer_cb(void *arg)
+{
+    if (wifi_connected || provisioning_active || !wifi_creds_present || !fallback_enabled)
+    {
+        return;
+    }
+    ESP_LOGW(TAG, "Fallback timeout (%u min) reached - starting BLE provisioning",
+             fallback_timeout_min);
+    if (wifi_retry_timer)
+    {
+        esp_timer_stop(wifi_retry_timer);
+    }
+    start_provisioning();
+}
+
+/* Arms the one-shot fallback timer for the current policy window. The timer
+   callback re-checks the state, so over-arming is harmless. */
+static void start_fallback_timer(void)
+{
+    if (fallback_enabled && wifi_creds_present)
+    {
+        uint64_t delay_us = (uint64_t)fallback_timeout_min * 60ULL * 1000000ULL;
+        esp_timer_start_once(fallback_timer, delay_us);
+        ESP_LOGI(TAG, "Fallback timer armed: provisioning after %u min without connection",
+                 fallback_timeout_min);
+    }
+}
+
+static void stop_fallback_timer(void)
+{
+    if (fallback_timer)
+    {
+        esp_timer_stop(fallback_timer);
+    }
+}
+
+static void wifi_provision_connect(const char *line)
+{
+    char ssid[WIFI_SSID_MAX];
+    char pass[WIFI_PASS_MAX];
+
+    if (!json_get_string(line, "ssid", ssid, sizeof(ssid)) || strlen(ssid) == 0)
+    {
+        ESP_LOGW(TAG, "Connect command missing ssid");
+        ble_prov_send_status("error", "missing ssid");
+        return;
+    }
+    json_get_string(line, "password", pass, sizeof(pass));
+
+    save_wifi_creds(ssid, pass);
+    snprintf(wifi_ssid, sizeof(wifi_ssid), "%s", ssid);
+    snprintf(wifi_pass, sizeof(wifi_pass), "%s", pass);
+    wifi_creds_present = true;
+    removed_blink = false;
+
+    provisioning_active = false;
+    ble_prov_stop_adv();
+    wifi_retry_count = 0;
+    if (wifi_retry_timer)
+    {
+        esp_timer_stop(wifi_retry_timer);
+    }
+
+    /* New credentials mean a fresh attempt: start a new fallback window. */
+    start_fallback_timer();
+
+    ESP_LOGI(TAG, "Received Wi-Fi credentials over BLE, connecting to '%s'", ssid);
+
+    wifi_config_t cfg = {
+        .sta = {
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+    snprintf((char *)cfg.sta.ssid, sizeof(cfg.sta.ssid), "%.31s", ssid);
+    snprintf((char *)cfg.sta.password, sizeof(cfg.sta.password), "%.63s", pass);
+
+    esp_wifi_disconnect();
+    esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    esp_wifi_connect();
+
+    ble_prov_send_status("connecting", "credentials saved");
+}
+
+static void ble_rx_line_cb(const char *line, size_t len)
+{
+    ESP_LOGI(TAG, "BLE command received: %.*s", (int)len, line);
+    char type[16];
+    if (!json_get_string(line, "type", type, sizeof(type)))
+    {
+        ESP_LOGW(TAG, "Unrecognized BLE message: %.*s", (int)len, line);
+        return;
+    }
+
+    if (strcmp(type, "scan") == 0)
+    {
+        wifi_scan_start();
+    }
+    else if (strcmp(type, "connect") == 0)
+    {
+        wifi_provision_connect(line);
+    }
+    else
+    {
+        ESP_LOGW(TAG, "Unknown BLE command type: %s", type);
+    }
+}
+
+static void ble_conn_cb(bool connected)
+{
+    if (connected)
+    {
+        char hello[128];
+        snprintf(hello, sizeof(hello),
+                 "{\"type\":\"hello\",\"device_id\":\"%s\",\"wifi\":\"%s\"}",
+                 device_id, wifi_connected ? "connected" : "provisioning");
+        ble_prov_send(hello);
+        ble_prov_send_status(wifi_connected ? "connected" : "provisioning",
+                             wifi_connected ? "device online" : "waiting for credentials");
+    }
+}
+
+/* ---------- Wi-Fi with exponential backoff (non-blocking timer) ---------- */
+
+static void wifi_retry_timer_cb(void *arg)
+{
+    if (!provisioning_active)
+    {
+        esp_wifi_connect();
+    }
+}
+
+static void schedule_wifi_retry(void)
+{
+    if (provisioning_active)
+    {
+        /* Already falling back to BLE provisioning: don't keep retrying. */
+        return;
+    }
+    int shift = wifi_retry_count;
+    if (shift > 16)
+    {
+        shift = 16;
+    }
+    int delay_ms = WIFI_RETRY_BASE_DELAY_MS << shift;
+    if (delay_ms > WIFI_RETRY_MAX_DELAY_MS || delay_ms <= 0)
+    {
+        delay_ms = WIFI_RETRY_MAX_DELAY_MS;
+    }
+    ESP_LOGW(TAG, "Wi-Fi disconnected, retrying in %d ms", delay_ms);
+    esp_timer_start_once(wifi_retry_timer, (uint64_t)delay_ms * 1000ULL);
+}
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
+    {
+        wifi_connected = false;
+        start_blinking_if_needed();
+        if (wifi_creds_present)
+        {
+            /* Window starts when we first start trying to connect; it is reset
+               on a successful connect (GOT_IP). */
+            start_fallback_timer();
+            esp_wifi_connect();
+        }
+        else
+        {
+            start_provisioning();
+        }
+    }
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
+    {
+        wifi_connected = false;
+        esp_timer_stop(heartbeat_timer);
+        start_blinking_if_needed();
+
+        /* No stored credentials (e.g. after a remove command): go straight to
+           provisioning instead of retrying an empty config. */
+        if (!wifi_creds_present)
+        {
+            start_provisioning();
+            return;
+        }
+
+        wifi_retry_count++;
+        schedule_wifi_retry();
+    }
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_SCAN_DONE)
+    {
+        handle_scan_done();
+    }
+    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
+    {
+        ESP_LOGI(TAG, "Wi-Fi connected, got IP");
+        wifi_connected = true;
+        wifi_retry_count = 0;
+        esp_timer_stop(wifi_retry_timer);
+        stop_fallback_timer();
+        esp_timer_start_periodic(heartbeat_timer, HEARTBEAT_INTERVAL_MS * 1000ULL);
+
+        provisioning_active = false;
+        ble_prov_stop_adv();
+
+        /* If a phone is still attached via BLE, tell it we made it online. */
+        if (ble_prov_is_connected())
+        {
+            ble_prov_send_status("connected", "device is online");
+        }
+
+        /* let blink_task notice wifi_connected and exit on its own,
+           it will restore the correct LED state when it does */
+
+        if (mqtt_client == NULL)
+        {
+            start_mqtt();
+        }
+    }
+}
+
+static void wifi_init(void)
+{
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
+
+    esp_timer_create_args_t timer_args = {
+        .callback = wifi_retry_timer_cb,
+        .name = "wifi_retry",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &wifi_retry_timer));
+
+    esp_timer_create_args_t fb_timer_args = {
+        .callback = fallback_timer_cb,
+        .name = "wifi_fallback",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&fb_timer_args, &fallback_timer));
+
+    esp_timer_create_args_t hb_timer_args = {
+        .callback = heartbeat_timer_cb,
+        .name = "status_hb",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&hb_timer_args, &heartbeat_timer));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+    snprintf((char *)wifi_config.sta.ssid, sizeof(wifi_config.sta.ssid), "%.31s", wifi_ssid);
+    snprintf((char *)wifi_config.sta.password, sizeof(wifi_config.sta.password), "%.63s", wifi_pass);
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    /* Lower TX power can help boards with a poorly matched/grounded antenna.
+       Range is 8..84 in units of 0.25dBm (e.g. 60 = 15dBm). Tune as needed. */
+    esp_wifi_set_max_tx_power(60);
+}
+
+void app_main(void)
+{
+    gpio_reset_pin(LED_GPIO);
+    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    temperature_sensor_config_t temp_cfg = {
+        .range_min = 10,
+        .range_max = 80,
+    };
+    ESP_ERROR_CHECK(temperature_sensor_install(&temp_cfg, &temp_sensor));
+    ESP_ERROR_CHECK(temperature_sensor_enable(temp_sensor));
+    ESP_LOGI(TAG, "Temperature sensor initialized");
+
+    led_state = load_led_state();
+    ESP_LOGI(TAG, "Restored LED state from NVS: %s", led_state ? "ON" : "OFF");
+
+    apply_led_gpio(false); /* keep off during blink startup until connected */
+
+    build_device_identity();
+
+    wifi_creds_present = load_wifi_creds();
+    ESP_LOGI(TAG, "Wi-Fi credentials %s", wifi_creds_present ? "loaded" : "NOT set (BLE provisioning mode)");
+
+    load_device_settings();
+
+    ESP_ERROR_CHECK(ble_prov_init(ble_rx_line_cb, ble_conn_cb));
+
+    ESP_LOGI(TAG, "Starting LED MQTT controller");
+
+    wifi_init();
+}
