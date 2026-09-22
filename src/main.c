@@ -1711,6 +1711,7 @@ static void wifi_init(void)
 void app_main(void)
 {
     ESP_LOGI(TAG, "Firmware version: %s", FIRMWARE_VERSION);
+    ESP_LOGW(TAG, "*** OTA VERIFICATION BUILD *** running %s", FIRMWARE_VERSION);
 
     gpio_reset_pin(LED_GPIO);
     gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
