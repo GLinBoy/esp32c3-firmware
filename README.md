@@ -215,8 +215,9 @@ effectiveness:
   ESP-IDF Component Registry (needed because some PlatformIO-packaged versions
   of ESP-IDF ship with an incomplete built-in `mqtt` component)
 - `platformio.ini` — board/environment configuration
-- `partitions_2mb.csv` — partition table for 2MB-flash boards (single large app
-  partition; BLE firmware no longer fits the default 1MB app partition)
+- `partitions.csv` — OTA-enabled partition table for 4MB-flash boards (two
+  1700K app slots, `ota_0` + `ota_1`, so firmware can be updated over the air)
+- `tools/publish_ota.py` — publishes an OTA notification to `devices/ota`
 - `sdkconfig.defaults` — persisted configuration defaults (console output
   routing, MQTT buffer size, BLE/NimBLE enablement)
 
@@ -236,12 +237,11 @@ pio run --target upload
 pio device monitor
 ```
 
-> **Flash size:** this board has **2MB flash**, so the project uses a custom
-> partition table (`partitions_2mb.csv`, set via `board_build.partitions` in
-> `platformio.ini`) that gives the app a single 1.75MB partition. The default
-> 1MB app partition cannot hold the BLE firmware. If your board actually has
-> 4MB flash, you can switch to `board_build.flash_size = 4MB` and remove the
-> custom partition line instead.
+> **Flash size:** this project targets **4MB flash**, so it uses a custom
+> OTA-capable partition table (`partitions.csv`, set via `board_build.partitions`
+> in `platformio.ini`) with two 1700K app slots for A/B OTA updates. The board
+> must be configured with `board_build.flash_size = 4MB`. If your board has less
+> flash, you must adjust the partition table and flash size together.
 
 ### If the build fails with a missing config/component error
 If you change `sdkconfig.defaults` and rebuild but nothing seems to change, the
@@ -308,7 +308,8 @@ This setup is intended for **prototyping and testing only**:
   the world can subscribe to the same topics if they guess or discover your
   topic names, and there is no encryption on the connection (`mqtt://`, not
   `mqtts://`).
-- Wi-Fi credentials are stored in plain text in the firmware source code.
+- Wi-Fi credentials provisioned over BLE are stored in plain text in NVS
+  (on-chip flash); they are not encrypted at rest.
 
 Before using this in any production, home-security-relevant, or otherwise
 sensitive context, you should:
@@ -316,8 +317,8 @@ sensitive context, you should:
   HiveMQ Cloud or EMQX Cloud) with username/password or certificate
   authentication.
 - Use TLS (`mqtts://`, typically port 8883) instead of plain `mqtt://`.
-- Avoid hardcoding Wi-Fi credentials directly in source control; consider a
-  separate, git-ignored configuration header or provisioning mechanism.
+- Avoid hardcoding Wi-Fi credentials in source control; use the built-in BLE
+  provisioning flow so credentials live only in device NVS.
 
 ---
 
@@ -337,3 +338,58 @@ sensitive context, you should:
   remember the LED's last commanded state.
 - **GPIO** — General Purpose Input/Output; a physical pin on the chip that
   can be set high or low to control something like an LED, or read a sensor.
+
+---
+
+## CI/CD Pipeline
+
+This project uses GitHub Actions for continuous integration and releases.
+
+### Workflows
+
+- **`firmware-ci.yml`**: Builds firmware on every push/PR to verify compilation
+- **`firmware-release.yml`**: Builds and publishes firmware binaries on semver tags
+
+### Creating a Release
+
+```bash
+git tag v1.1.0
+git push origin v1.1.0
+```
+
+GitHub Actions will:
+
+1. Build firmware with version `1.1.0` injected
+2. Generate SHA-256 checksum
+3. Create GitHub Release with `firmware.bin`, `partitions.bin`, and checksum
+
+### OTA Updates
+
+Devices automatically check for updates via MQTT topic `devices/ota`:
+
+- **Push notification**: Backend publishes update metadata to `devices/ota` (retained)
+- **Boot-time check**: Device checks `devices/ota` on every boot as fallback
+
+To trigger OTA manually:
+
+```bash
+python tools/publish_ota.py 1.1.0 https://github.com/GLinBoy/esp32c3-firmware/releases/download/v1.1.0/firmware.bin <sha256>
+```
+
+**Important**: MQTT broker URL is configurable via NVS, default is `test.mosquitto.org:1883`.
+See `PLAN_ASSISTANCE_CONTROL.md` Phase A for migration to private authenticated broker (EMQX/HiveMQ).
+
+---
+
+## Partition Table
+
+**WARNING**: This project uses a custom OTA-enabled partition table (`partitions.csv`) with two 1700K app slots.
+
+If you modify the partition table:
+
+1. Delete `.pio/build` directory
+2. Delete generated `sdkconfig` file
+3. Run `pio run --target fullclean`
+4. Rebuild: `pio run`
+
+Incremental builds do NOT reliably pick up partition table changes and will cause silent boot failures.
